@@ -23,12 +23,13 @@ from garage.tf.optimizers import LbfgsOptimizer
 @unique
 class PGLoss(Enum):
     VANILLA = "vanilla"
-    CLIP = "clip"
+    SURROGATE = "surrogate"
+    SURROGATE_CLIP = "surrogate_clip"
 
 
 class NPO(BatchPolopt):
     def __init__(self,
-                 pg_loss=PGLoss.VANILLA,
+                 pg_loss=PGLoss.SURROGATE,
                  clip_range=0.01,
                  optimizer=None,
                  optimizer_args=None,
@@ -56,7 +57,7 @@ class NPO(BatchPolopt):
             self.clip_range = float(clip_range)
             self.policy_ent_coeff = float(policy_ent_coeff)
 
-        super(NPO, self).__init__(policy=policy, **kwargs)
+        super().__init__(policy=policy, **kwargs)
 
     @overrides
     def init_opt(self):
@@ -291,6 +292,21 @@ class NPO(BatchPolopt):
                     )
                     pol_mean_kl = tf.reduce_mean(kl)
 
+            # Calculate vanilla loss
+            with tf.name_scope("vanilla_loss"):
+                if self.policy.recurrent:
+                    ll = pol_dist.log_likelihood_sym(
+                        i.action_var, policy_dist_info, name="log_likelihood")
+
+                    vanilla = ll * advantages * i.valid_var
+                else:
+                    ll = pol_dist.log_likelihood_sym(
+                        i.valid.action_var,
+                        policy_dist_info_valid,
+                        name="log_likelihood")
+
+                    vanilla = ll * adv_valid
+
             # Calculate surrogate loss
             with tf.name_scope("surr_loss"):
                 if self.policy.recurrent:
@@ -310,10 +326,15 @@ class NPO(BatchPolopt):
 
                     surr_vanilla = lr * adv_valid
 
+            # Finalize objective function
+            with tf.name_scope("final_loss"):
                 if self._pg_loss == PGLoss.VANILLA:
-                    # VPG, TRPO use the standard surrogate objective
-                    surr_obj = tf.identity(surr_vanilla, name="surr_obj")
-                elif self._pg_loss == PGLoss.CLIP:
+                    # VPG uses the vanilla objective
+                    obj = tf.identity(vanilla, name="vanilla_obj")
+                elif self._pg_loss == PGLoss.SURROGATE:
+                    # TRPO uses the standard surrogate objective
+                    obj = tf.identity(surr_vanilla, name="surr_obj")
+                elif self._pg_loss == PGLoss.SURROGATE_CLIP:
                     lr_clip = tf.clip_by_value(
                         lr,
                         1 - self.clip_range,
@@ -323,18 +344,16 @@ class NPO(BatchPolopt):
                         surr_clip = lr_clip * advantages * i.valid_var
                     else:
                         surr_clip = lr_clip * adv_valid
-                    surr_obj = tf.minimum(
-                        surr_vanilla, surr_clip, name="surr_obj")
+                    obj = tf.minimum(surr_vanilla, surr_clip, name="surr_obj")
                 else:
                     raise NotImplementedError("Unknown PGLoss")
 
                 # Maximize E[surrogate objective] by minimizing
                 # -E_t[surrogate objective]
                 if self.policy.recurrent:
-                    surr_loss = (-tf.reduce_sum(surr_obj)) / tf.reduce_sum(
-                        i.valid_var)
+                    loss = (-tf.reduce_sum(obj)) / tf.reduce_sum(i.valid_var)
                 else:
-                    surr_loss = -tf.reduce_mean(surr_obj)
+                    loss = -tf.reduce_mean(obj)
 
             # Diagnostic functions
             self.f_policy_kl = tensor_utils.compile_function(
@@ -354,7 +373,7 @@ class NPO(BatchPolopt):
                 returns,
                 log_name="f_returns")
 
-            return surr_loss, pol_mean_kl
+            return loss, pol_mean_kl
 
     def _build_entropy_term(self, i):
         with tf.name_scope("policy_entropy"):
